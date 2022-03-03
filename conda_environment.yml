@@ -1,0 +1,14 @@
+# Assumes that conda and build-essentials are installed
+---
+name: timeseries-importer
+channels:
+- conda-forge
+
+dependencies:
+- python=3.7
+- jupyter
+- pandas
+- requests
+- haversine
+- netCDF4
+- pyproj
