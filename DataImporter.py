@@ -20,6 +20,7 @@ Test for the construction of a data set:
 import argparse
 import sys
 import datetime
+from time import time
 from traceback import format_exc
 import pandas as pd
 
@@ -74,6 +75,10 @@ class DataImporter:
         timeseries = timeseries.reset_index()
         data = pd.merge(data.set_index("time"), timeseries.set_index("time"), how="left", on="time")
 
+        if True:
+            self.__log("The data fetching is restricted to the range when swimming temperatures are available")
+            self.start_time = data.index[0].to_pydatetime().replace(tzinfo=None)
+            self.end_time = data.index[-1].to_pydatetime().replace(tzinfo=None)
         self.__log("-------------------------------------------")
 
         #########################################################
@@ -111,12 +116,17 @@ class DataImporter:
         #########################################################
         # time series from THREDDS norkyst
         self.__log("Fetching data from THREDDS")
+        depth=[0,3,10]
+
         norkystImporter = NorKystImporter.NorKystImporter(self.start_time, self.end_time)
         timeseries = norkystImporter.norkyst_data("temperature", 
-                        float(location["lon"][0]), float(location["lat"][0]), depth=0)
+                                                  float(location["lon"][0]), float(location["lat"][0]), depth=depth)
 
         timeseries = timeseries.rename(columns={"referenceTime":"time"})
-        timeseries = timeseries.rename(columns={"temperature0":"norkyst_water_temp"})
+        for c in timeseries.columns:
+            if isinstance(c, str):
+                if c.startswith("temperature"):
+                    timeseries = timeseries.rename(columns={c:c.replace("temperature", "norkyst_water_temp")})
         
         data = data.reset_index()
         data = pd.merge(data.set_index("time"), timeseries.set_index("time"), how="left", on="time")
@@ -126,7 +136,7 @@ class DataImporter:
 
         #########################################################
         # time series from THREDDS post-processed forecast
-        pp_params = ['air_temperature_2m', 'wind_speed_10m',\
+        pp_params = ['air_temperature_2m', 'wind_speed_10m', 'wind_direction_10m','precipitation_amount',\
             'cloud_area_fraction', 'integral_of_surface_downwelling_shortwave_flux_in_air_wrt_time']
 
         self.__log("Fetching data from THREDDS")
@@ -150,7 +160,7 @@ class DataImporter:
         #########################################################
         # save dataset
         self.__log("Dataset is constructed and will be saved now...")
-        data.to_csv("dataset.csv")
+        data.to_csv("dataset_"+station_id+".csv")
         self.__log("Ready!")
 
     
