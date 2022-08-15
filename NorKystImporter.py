@@ -26,6 +26,7 @@ TODO:
 """
 
 import argparse
+import time
 import datetime
 from traceback import format_exc
 import netCDF4
@@ -60,42 +61,44 @@ class NorKystImporter:
             self.start_time = start_time
             self.end_time = end_time
 
+            self.filenames = None
+
+            self.x1 = None
+            self.y1 = None
+
+            
     @staticmethod
     def daterange(start_date, end_date):
         # +1 to include end_date 
         # and +1 in case the time interval is not divisible with 24 hours (to get the last hours into the last day)
-        for i in range(int((end_date - start_date).days + 2)):
-            yield start_date + datetime.timedelta(i)
+        for i in range(int((end_date - start_date).days + 1)):
+            yield (start_date + datetime.timedelta(i)).date()
 
     def norkyst_filenames(self):
         """Constructing list with filenames of the individual THREDDS netCDF files 
         for the relevant time period"""
 
         filenames = []
-        print("Filename timestamp based on start_time: " + self.start_time.strftime("%Y%m%d%H"))
-        print("Filename timestamp based on end_time: " + self.end_time.strftime("%Y%m%d%H"))
-
+        
         # add all days in specified time interval (including the day self.end_time)
         for single_date in self.daterange(self.start_time, self.end_time):
             filenames.append(
                 single_date.strftime("https://thredds.met.no/thredds/dodsC/fou-hi/norkyst800m-1h/NorKyst-800m_ZDEPTHS_his.an.%Y%m%d00.nc"))
 
         #NOTE: For some days there do not exist files in the THREDDS catalog.
-        # The list of filenames is cleaned such that all filenames are valid
-        clean_filenames = []
-        for f in range(len(filenames)):
-            try:
-                nc_test = netCDF4.Dataset(filenames[f])
-                clean_filenames.append(filenames[f])
-            except OSError as err:
-                print("OS error: {0}".format(err))
+        # The list of filenames is cleaned such that the first filename is valid
+        testing = True
+        while testing:
+            try: 
+                nc = netCDF4.Dataset(filenames[0])
+                testing = False
+            except:
+                filenames.pop(0)
 
-        print("Reading following files: " + str(clean_filenames))
-        
-        return clean_filenames
+        return filenames
 
 
-    def norkyst_data(self, param, lon, lat, start_time=None, end_time=None, depth=None):
+    def norkyst_data(self, param, lon, lat, start_time=None, end_time=None, depth=0):
         """Fetches relevant netCDF files from THREDDS 
         and constructs a timeseries in a data frame"""
 
@@ -105,92 +108,113 @@ class NorKystImporter:
         if end_time is None:
             end_time = self.end_time
 
-        # Filenames for fetching
-        clean_filenames = self.norkyst_filenames()
+        if self.filenames is None:
+            # Filenames for fetching
+            self.filenames = self.norkyst_filenames()
 
-        # Load multi-file object
-        nc = netCDF4.MFDataset(clean_filenames)
+        # Load first object
+        # and use it to specify the coordinates
+        nc = netCDF4.Dataset(self.filenames[0])
+        print("- " + time.strftime("%H:%M:%S", time.gmtime()) + " -")
 
-        # handle projection
-        for var in ['polar_stereographic','projection_stere','grid_mapping']:
-            if var in nc.variables.keys():
-                try:
-                    proj1 = nc.variables[var].proj4
-                except:
-                    proj1 = nc.variables[var].proj4string
-        p1 = proj.Proj(str(proj1))
-        xp1,yp1 = p1(lon,lat)
-        for var in ['latitude','lat']:
-            if var in nc.variables.keys():
-                lat1 = nc.variables[var][:]
-        for var in ['longitude','lon']:
-            if var in nc.variables.keys():
-                lon1 = nc.variables[var][:]
-        xproj1,yproj1 = p1(lon1,lat1)
+        if self.x1 is None:
+            # handle projection
+            for var in ['polar_stereographic','projection_stere','grid_mapping']:
+                if var in nc.variables.keys():
+                    try:
+                        proj1 = nc.variables[var].proj4
+                    except:
+                        proj1 = nc.variables[var].proj4string
+            p1 = proj.Proj(str(proj1))
+            xp1,yp1 = p1(lon,lat)
+            for var in ['latitude','lat']:
+                if var in nc.variables.keys():
+                    lat1 = nc.variables[var][:]
+            for var in ['longitude','lon']:
+                if var in nc.variables.keys():
+                    lon1 = nc.variables[var][:]
+            xproj1,yproj1 = p1(lon1,lat1)
 
-        # find coordinate of gridpoint to analyze
-        x1=self.__find_nearest_index(xproj1[0,:],xp1)
-        y1=self.__find_nearest_index(yproj1[:,0],yp1)
+            # find coordinate of gridpoint to analyze (only wet cells)
+            h = np.array(nc["h"])
+            land_value = h.min()
+            land_mask = np.where((h!=land_value),0,1)
+            distances = (xproj1-xp1)**2 + (yproj1-yp1)**2 + land_mask*1e12
+            self.y1, self.x1 = np.unravel_index(distances.argmin(), distances.shape)
 
-        print('Coordinates model (x,y= '+str(x1)+','+str(y1)+'): '+str(lat1[y1,x1])+', '+str(lon1[y1,x1]))
+            print('Coordinates model (x,y= '+str(self.x1)+','+str(self.y1)+'): '+str(lat1[self.y1,self.x1])+', '+str(lon1[self.y1,self.x1]))
 
-        # find correct time indices for start and end of timeseries
-        all_times = nc.variables["time"]
-        
-        first = netCDF4.num2date(all_times[0],all_times.units)
-        last = netCDF4.num2date(all_times[-1],all_times.units)
-        print("First available time: " + first.strftime("%Y-%m-%dT%H:%M"))
-        print("Last available time: " + last.strftime("%Y-%m-%dT%H:%M"))
-  
-        try:
-            t1 = netCDF4.date2index(start_time, all_times, calendar=all_times.calendar, select="before")
-        except:
-            t1 = 0
-        try:
-            t2 = netCDF4.date2index(end_time, all_times, calendar=all_times.calendar, select="after")
-        except:
-            t2 = len(all_times[:])
-
-        if depth is not None:
-            # find correct depth index
-            all_depths = nc.variables["depth"][:]
+        # find correct depth index
+        all_depths = nc.variables["depth"][:]
+        if isinstance(depth, list):
+            depth_index = []
+            for d in depth:
+                depth_index.append(np.where(all_depths == int(d))[0][0])
+        else:
             depth_index = np.where(all_depths == int(depth))[0][0]
 
-            # EXTRACT REFERENCE TIMES
-            # the times fetched from Thredds are in the cftime.GregorianDatetime format,
-            # but since pandas does not understand that format we have to cast to datetime by hand
-            cftimes = netCDF4.num2date(nc.variables["time"][t1:t2], all_times.units)
-            datetimes = self.__cftime2datetime(cftimes)
+        # find correct time indices for start and end of timeseries
+        times = nc.variables["time"]
+        try:
+            t1 = netCDF4.date2index(start_time, times, calendar=times.calendar, select="before")
+            t1 = max(0,t1)
+        except:
+            t1 = 0
+        
+        # FIRST FILE
+        timeseries = self.data1file(self.filenames[0],self.y1,self.x1,param,depth,depth_index,t1=t1)
 
-            # EXTRACT DATA
-            data = nc.variables[param][t1:t2,depth_index,y1,x1]
+        # LOOP OVER EACH FILE
+        for i in range(1,len(self.filenames)-1):
+            try:
+                new_timeseries = self.data1file(self.filenames[i],self.y1,self.x1,param,depth,depth_index)
+                timeseries = pd.concat([timeseries,new_timeseries], ignore_index=True)
+            except:
+                pass
 
-            # Dataframe for return
-            timeseries = pd.DataFrame({"referenceTime":datetimes, param+str(depth):data})
+        # LAST FILE
+        try:
+            nc = netCDF4.Dataset(self.filenames[-1])
+            times = nc.variables["time"]
+            try:
+                t2 = netCDF4.date2index(end_time, times, calendar=times.calendar, select="after")
+            except:
+                t2 = len(times[:])
 
-            #NOTE: Since the other data sources explicitly specify the time zone
-            # the tz is manually added to the datetime here
-            timeseries["referenceTime"] = timeseries["referenceTime"].dt.tz_localize(tz="UTC")         
+            new_timeseries = self.data1file(self.filenames[-1],self.y1,self.x1,param,depth,depth_index,t2=t2)
+            timeseries = pd.concat([timeseries,new_timeseries], ignore_index=True)
+        except:
+            pass
 
-            return timeseries
+        #NOTE: Since the other data sources explicitly specify the time zone
+        # the tz is manually added to the datetime here
+        timeseries["referenceTime"] = timeseries["referenceTime"].dt.tz_localize(tz="UTC")         
+
+        return timeseries
+
+    def data1file(self,filename,y1,x1,param,depth,depth_index,t1=0,t2=None):
+        nc = netCDF4.Dataset(filename)
+        print("- " + time.strftime("%H:%M:%S", time.gmtime()) + " -")
+        print("Processing ", filename)
+        # EXTRACT REFERENCE TIMES
+        # the times fetched from Thredds are in the cftime.GregorianDatetime format,
+        # but since pandas does not understand that format we have to cast to datetime by hand
+        cftimes = netCDF4.num2date(nc.variables["time"][t1:t2], nc.variables["time"].units)
+        datetimes = self.__cftime2datetime(cftimes)
+
+        # FIRST DATA
+        data = nc.variables[param][t1:t2,depth_index,y1,x1]
+        # Dataframe for return
+        timeseries = pd.DataFrame(data)
+        timeseries["referenceTime"] = datetimes 
+        
+        if isinstance(depth, list): 
+            for d in range(len(depth)):
+                timeseries = timeseries.rename(columns={d:param+str(depth[d])})
         else:
-            # EXTRACT REFERENCE TIMES
-            # the times fetched from Thredds are in the cftime.GregorianDatetime format,
-            # but since pandas does not understand that format we have to cast to datetime by hand
-            cftimes = netCDF4.num2date(nc.variables["time"][t1:t2], all_times.units)
-            datetimes = self.__cftime2datetime(cftimes)
+            timeseries = timeseries.rename(columns={"0":str(depth)})
 
-            # EXTRACT DATA
-            data = nc.variables[param][t1:t2,y1,x1]
-
-            # Dataframe for return
-            timeseries = pd.DataFrame({"referenceTime":datetimes, param:data})
-
-            #NOTE: Since the other data sources explicitly specify the time zone
-            # the tz is manually added to the datetime here
-            timeseries["referenceTime"] = timeseries["referenceTime"].dt.tz_localize(tz="UTC")         
-
-            return timeseries
+        return timeseries
 
 
     @staticmethod
@@ -232,7 +256,39 @@ class NorKystImporter:
             help='end time in ISO format (YYYY-MM-DDTHH:MM) UTC')
         res = parser.parse_args(sys.argv[1:])
         return res.lon, res.lat, res.depth, res.param, res.start_time, res.end_time
+    
 
+    @staticmethod
+    def simulated_depth(lat, lon):
+        """returning H for the grid cell that contains the station or is the closest wet cell"""
+        nc = netCDF4.Dataset('https://thredds.met.no/thredds/dodsC/fou-hi/norkyst800m-1h/NorKyst-800m_ZDEPTHS_his.an.2021100100.nc')
+        # handle projection
+        for var in ['polar_stereographic','projection_stere','grid_mapping']:
+            if var in nc.variables.keys():
+                try:
+                    proj1 = nc.variables[var].proj4
+                except:
+                    proj1 = nc.variables[var].proj4string
+        p1 = proj.Proj(str(proj1))
+        xp1,yp1 = p1(lon,lat)
+        for var in ['latitude','lat']:
+            if var in nc.variables.keys():
+                lat1 = nc.variables[var][:]
+        for var in ['longitude','lon']:
+            if var in nc.variables.keys():
+                lon1 = nc.variables[var][:]
+        xproj1,yproj1 = p1(lon1,lat1)
+
+        # find coordinate of gridpoint to analyze (only wet cells)
+        h = np.array(nc["h"])
+        land_value = h.min()
+        land_mask = np.where((h!=land_value),0,1)
+        distances = (xproj1-xp1)**2 + (yproj1-yp1)**2 + land_mask*1e12
+        y1, x1 = np.unravel_index(distances.argmin(), distances.shape)
+
+        return nc.variables["h"][y1,x1].data.item()
+    
+    
 if __name__ == "__main__":
 
     try:
